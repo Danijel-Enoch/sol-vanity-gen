@@ -1,5 +1,8 @@
 use csv::WriterBuilder;
-use solana_sdk::signature::{Keypair, Signer};
+use solana_sdk::{
+    bs58,
+    signature::{Keypair, Signer},
+};
 use std::{
     fs::File,
     io::{self, BufWriter, Write},
@@ -15,12 +18,13 @@ fn main() -> io::Result<()> {
     display_banner();
     let vanity_string = read_vanity_string()?;
     let case_sensitive = read_case_sensitivity()?;
+    let wallet_count_target = read_wallet_count_target()?;
     let max_threads = read_thread_count()?;
     let csv_file_path = "vanity_wallets.csv".to_string();
 
     prepare_csv_file(&csv_file_path)?;
 
-    let found_flag = Arc::new(AtomicBool::new(false));
+    let found_count = Arc::new(Mutex::new(0u64));
     let wallet_count = Arc::new(Mutex::new(0));
 
     let (tx, rx) = mpsc::channel();
@@ -28,7 +32,8 @@ fn main() -> io::Result<()> {
         max_threads,
         vanity_string,
         case_sensitive,
-        found_flag.clone(),
+        found_count.clone(),
+        wallet_count_target,
         wallet_count.clone(),
         tx,
     );
@@ -38,10 +43,15 @@ fn main() -> io::Result<()> {
     // Periodically print the count of generated wallets
     let counter_handle = {
         let wallet_count = wallet_count.clone();
-        let found_flag = found_flag.clone();
+        let found_count = found_count.clone();
         thread::spawn(move || {
-            while !found_flag.load(Ordering::SeqCst) {
-                print!("\rWallets generated: {}", wallet_count.lock().unwrap());
+            while *found_count.lock().unwrap() < wallet_count_target {
+                print!(
+                    "\rWallets generated: {} | Found: {}/{}",
+                    wallet_count.lock().unwrap(),
+                    found_count.lock().unwrap(),
+                    wallet_count_target
+                );
                 io::stdout().flush().unwrap();
                 thread::sleep(Duration::from_millis(25));
             }
@@ -53,8 +63,13 @@ fn main() -> io::Result<()> {
     }
 
     let _ = writer_handle.join();
-    let _ = counter_handle.join(); // Ensure the counter thread is also joined
-    report_completion(&found_flag, &wallet_count, Instant::now());
+    let _ = counter_handle.join();
+    report_completion(
+        &found_count,
+        &wallet_count,
+        wallet_count_target,
+        Instant::now(),
+    );
 
     Ok(())
 }
@@ -93,10 +108,20 @@ fn read_thread_count() -> io::Result<usize> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
 }
 
+fn read_wallet_count_target() -> io::Result<u64> {
+    println!("Enter the number of wallets to find: ");
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    input
+        .trim()
+        .parse::<u64>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+}
+
 fn prepare_csv_file(path: &str) -> io::Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
-    writeln!(writer, "Public Key,Note")?;
+    writeln!(writer, "Public Key,Private Key,Note")?;
     Ok(())
 }
 
@@ -104,26 +129,28 @@ fn spawn_threads(
     max_threads: usize,
     vanity_string: String,
     case_sensitive: bool,
-    found_flag: Arc<AtomicBool>,
+    found_count: Arc<Mutex<u64>>,
+    wallet_count_target: u64,
     wallet_count: Arc<Mutex<u64>>,
-    tx: mpsc::Sender<String>,
+    tx: mpsc::Sender<(String, String)>,
 ) -> Vec<thread::JoinHandle<()>> {
     (0..max_threads)
         .map(|_| {
             let vanity_string = vanity_string.clone();
-            let found_flag = Arc::clone(&found_flag);
+            let found_count = Arc::clone(&found_count);
             let wallet_count = Arc::clone(&wallet_count);
             let tx = tx.clone();
 
             thread::spawn(move || {
-                while !found_flag.load(Ordering::Relaxed) {
+                while *found_count.lock().unwrap() < wallet_count_target {
                     let keypair = Keypair::new();
                     let public_key = keypair.pubkey().to_string();
+                    let private_key = bs58::encode(keypair.to_bytes()).into_string();
 
                     if check_vanity_string(&public_key, &vanity_string, case_sensitive) {
-                        tx.send(public_key).unwrap();
-                        found_flag.store(true, Ordering::Relaxed);
-                        break;
+                        tx.send((public_key, private_key)).unwrap();
+                        let mut found = found_count.lock().unwrap();
+                        *found += 1;
                     }
 
                     let mut count = wallet_count.lock().unwrap();
@@ -135,13 +162,13 @@ fn spawn_threads(
 }
 
 fn start_csv_writer_thread(
-    rx: mpsc::Receiver<String>,
+    rx: mpsc::Receiver<(String, String)>,
     csv_file_path: String,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut wtr = WriterBuilder::new().from_path(&csv_file_path).unwrap();
-        while let Ok(public_key) = rx.recv() {
-            wtr.write_record(&[&public_key, "Seed Phrase Not Stored"])
+        while let Ok((public_key, private_key)) = rx.recv() {
+            wtr.write_record(&[&public_key, &private_key, "Generated by Vanity"])
                 .unwrap();
             wtr.flush().unwrap();
         }
@@ -150,25 +177,31 @@ fn start_csv_writer_thread(
 
 fn check_vanity_string(public_key: &str, vanity_string: &str, case_sensitive: bool) -> bool {
     if case_sensitive {
-        public_key.starts_with(vanity_string)
+        public_key.ends_with(vanity_string)
     } else {
         public_key
             .to_lowercase()
-            .starts_with(&vanity_string.to_lowercase())
+            .ends_with(&vanity_string.to_lowercase())
     }
 }
 
 fn report_completion(
-    found_flag: &Arc<AtomicBool>,
+    found_count: &Arc<Mutex<u64>>,
     wallet_count: &Arc<Mutex<u64>>,
+    wallet_count_target: u64,
     start_time: Instant,
 ) {
-    if found_flag.load(Ordering::Relaxed) {
-        println!("Vanity address found!");
+    let found = *found_count.lock().unwrap();
+    if found >= wallet_count_target {
+        println!("\nFound all {} vanity addresses!", wallet_count_target);
     } else {
-        println!("Vanity address not found.");
+        println!(
+            "\nFound {} out of {} vanity addresses.",
+            found, wallet_count_target
+        );
     }
-    let count = wallet_count.lock().unwrap();
-    println!("Wallets generated: {}", count);
+    let count = *wallet_count.lock().unwrap();
+    println!("Total wallets generated: {}", count);
     println!("Elapsed time: {:?}", start_time.elapsed());
+    println!("Results have been saved to vanity_wallets.csv");
 }
