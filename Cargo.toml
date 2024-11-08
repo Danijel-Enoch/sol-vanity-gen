@@ -8,5 +8,5 @@ edition = "2021"
 [dependencies]
 solana-client = "1.8"
 solana-sdk = "1.8"
-rayon = "1.5"
+rayon = "1.8"
 csv = "1.1"
